@@ -3,6 +3,9 @@ import multer from "multer";
 import { z } from "zod";
 import { ApiError, fail, ok } from "./envelope.js";
 import { configFromRequest, generateJson } from "./llm.js";
+import { runGeneratePipeline } from "./generator.js";
+import { extractDocumentContent, parseBlueprint, parseSpecification } from "./parser.js";
+import { selectTemplate } from "./template.js";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -22,15 +25,68 @@ api.get("/llm-check", async (req, res, next) => {
   }
 });
 
-// Your routes go here (Level 1 onward).
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+
+// Level 1: Parse uploaded specification and blueprint into structured course data
+api.post("/parse", upload.fields([{ name: "spec", maxCount: 1 }, { name: "blueprint", maxCount: 1 }]), async (req, res, next) => {
+  try {
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+    const specFile = files?.["spec"]?.[0];
+    if (!specFile) throw new ApiError(400, "MISSING_SPEC", "Required course specification file ('spec') missing.");
+
+    const specDoc = await extractDocumentContent(specFile.buffer, specFile.originalname, specFile.mimetype);
+    const parsedSpec = parseSpecification(specDoc.text, specDoc.html);
+
+    let parsedBlueprint;
+    const bpFile = files?.["blueprint"]?.[0];
+    if (bpFile) {
+      const bpDoc = await extractDocumentContent(bpFile.buffer, bpFile.originalname, bpFile.mimetype);
+      parsedBlueprint = parseBlueprint(bpDoc.text);
+    }
+
+    const template = selectTemplate(parsedSpec.course);
+
+    ok(res, {
+      template,
+      spec: parsedSpec,
+      blueprint: parsedBlueprint ?? null,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
 
 // The scorer runs your app and calls this route with the sample files, exactly like `npm run verify` does.
 // Contract: multipart fields "spec" (required) and "blueprint" (optional), AI key in the x-llm-* headers.
 // Reply: { success: true, data: { output: <specforge_output object>, html: "<the filled spec document>" } }
-// Level 3 builds it. Until then it answers 501.
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
-api.post("/generate", upload.fields([{ name: "spec", maxCount: 1 }, { name: "blueprint", maxCount: 1 }]), (_req, res) => {
-  fail(res, 501, "NOT_BUILT", "POST /api/v1/generate is not built yet (Level 3).");
+api.post("/generate", upload.fields([{ name: "spec", maxCount: 1 }, { name: "blueprint", maxCount: 1 }]), async (req, res, next) => {
+  try {
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+    const specFile = files?.["spec"]?.[0];
+    if (!specFile) throw new ApiError(400, "MISSING_SPEC", "Missing required course specification file ('spec').");
+
+    const bpFile = files?.["blueprint"]?.[0];
+
+    let cfg;
+    try {
+      cfg = configFromRequest(req);
+    } catch {
+      // Key may be absent in manual / test verification
+    }
+
+    const result = await runGeneratePipeline({
+      specBuffer: specFile.buffer,
+      specFilename: specFile.originalname,
+      blueprintBuffer: bpFile?.buffer,
+      blueprintFilename: bpFile?.originalname,
+      llmConfig: cfg,
+      inputId: "SAMPLE",
+    });
+
+    ok(res, result);
+  } catch (e) {
+    next(e);
+  }
 });
 
 app.use("/api/v1", api);
